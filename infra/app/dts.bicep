@@ -6,7 +6,7 @@ param taskhubname string
 param skuName string
 param skuCapacity int
 
-resource dts 'Microsoft.DurableTask/schedulers@2025-04-01-preview' = {
+resource dts 'Microsoft.DurableTask/schedulers@2026-02-01' = {
   location: location
   tags: tags
   name: name
@@ -18,7 +18,7 @@ resource dts 'Microsoft.DurableTask/schedulers@2025-04-01-preview' = {
   }
 }
 
-resource taskhub 'Microsoft.DurableTask/schedulers/taskHubs@2025-04-01-preview' = {
+resource taskhub 'Microsoft.DurableTask/schedulers/taskHubs@2026-02-01' = {
   parent: dts
   name: taskhubname
 }
