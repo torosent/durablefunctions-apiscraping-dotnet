@@ -138,11 +138,10 @@ module storage 'br/public:avm/res/storage/storage-account:0.8.3' = {
 }
 
 // Define the configuration object locally to pass to the modules
-// With Durable Task Scheduler, queue and table storage are no longer needed for Durable Functions
 var storageEndpointConfig = {
   enableBlob: true  // Required for AzureWebJobsStorage, .zip deployment, Event Hubs trigger and Timer trigger checkpointing
-  enableQueue: false  // Not required when using Durable Task Scheduler
-  enableTable: false  // Not required when using Durable Task Scheduler
+  enableQueue: true   // Required for AzureWebJobsStorage host operations and non-Durable triggers/bindings
+  enableTable: true   // Required for AzureWebJobsStorage host operations and non-Durable triggers/bindings
   enableFiles: false   // Not required, used in legacy scenarios
   allowUserIdentityPrincipal: true   // Allow interactive user identity to access for testing and debugging
 }
