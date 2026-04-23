@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Azure;
 using Azure.Data.Tables;
+using Azure.Identity;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
@@ -23,10 +24,39 @@ namespace FanOutFanInCrawler
             Credentials = !string.IsNullOrWhiteSpace(getToken()) ? new Credentials(getToken()) : Credentials.Anonymous
         };
 
-        // Table storage connection string. Defaults to AzureWebJobsStorage (e.g. Azurite) unless overridden.
-        private static readonly Func<string?> getStorageConnectionString = () =>
-            Environment.GetEnvironmentVariable("StorageConnectionString")
-            ?? Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+        // Resolve a TableServiceClient that works in both local dev (Azurite/connection string) and
+        // Azure (managed identity). Cloud deployments set `AzureWebJobsStorage__tableServiceUri` and use
+        // a managed identity (no shared key). Local dev sets `AzureWebJobsStorage` to a connection
+        // string (e.g. UseDevelopmentStorage=true). `StorageConnectionString` env var still wins
+        // when explicitly set (back-compat with the original sample).
+        private static TableServiceClient CreateTableServiceClient()
+        {
+            var explicitConn = Environment.GetEnvironmentVariable("StorageConnectionString");
+            if (!string.IsNullOrWhiteSpace(explicitConn))
+            {
+                return new TableServiceClient(explicitConn);
+            }
+
+            var tableUri = Environment.GetEnvironmentVariable("AzureWebJobsStorage__tableServiceUri");
+            if (!string.IsNullOrWhiteSpace(tableUri))
+            {
+                var clientId = Environment.GetEnvironmentVariable("AzureWebJobsStorage__clientId");
+                var credential = string.IsNullOrWhiteSpace(clientId)
+                    ? new DefaultAzureCredential()
+                    : new DefaultAzureCredential(new DefaultAzureCredentialOptions { ManagedIdentityClientId = clientId });
+                return new TableServiceClient(new Uri(tableUri), credential);
+            }
+
+            var awjs = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            if (!string.IsNullOrWhiteSpace(awjs))
+            {
+                return new TableServiceClient(awjs);
+            }
+
+            throw new InvalidOperationException(
+                "No storage configured. Set 'AzureWebJobsStorage__tableServiceUri' (managed identity, cloud) " +
+                "or 'AzureWebJobsStorage'/'StorageConnectionString' (connection string, local).");
+        }
 
         /// <summary>
         /// HTTP-triggered starter that kicks off the fan-out/fan-in orchestration.
@@ -103,14 +133,7 @@ namespace FanOutFanInCrawler
         {
             ILogger logger = executionContext.GetLogger(nameof(SaveRepositories));
 
-            var connectionString = getStorageConnectionString();
-            if (string.IsNullOrWhiteSpace(connectionString))
-            {
-                throw new InvalidOperationException(
-                    "No storage connection string is configured. Set 'StorageConnectionString' or 'AzureWebJobsStorage'.");
-            }
-
-            var serviceClient = new TableServiceClient(connectionString);
+            var serviceClient = CreateTableServiceClient();
             var tableClient = serviceClient.GetTableClient("Repositories");
 
             await tableClient.CreateIfNotExistsAsync();

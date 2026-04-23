@@ -12,7 +12,7 @@
       "value": "${AZURE_PRINCIPAL_ID}"
     },
     "vnetEnabled": {
-      "value": "${VNET_ENABLED}"
+      "value": "${VNET_ENABLED=false}"
     }
   }
 }

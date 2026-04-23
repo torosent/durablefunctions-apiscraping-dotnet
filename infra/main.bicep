@@ -38,9 +38,12 @@ param dtsName string = ''
 param taskHubName string = ''
 param dtsLocation string = location
 param dtsSkuName string = 'Consumption'
-param dtsCapacity int = 1
 @description('Id of the user identity to be used for testing and debugging. This is not required in production. Leave empty if not needed.')
 param principalId string = deployer().objectId
+
+@description('Type of principal for the deployer principalId. Defaults to "User" for interactive `azd up`; set to "ServicePrincipal" when running in CI/CD.')
+@allowed(['User', 'ServicePrincipal', 'Group'])
+param principalType string = 'User'
 
 var abbrs = loadJsonContent('./abbreviations.json')
 var resourceToken = toLower(uniqueString(subscription().id, environmentName, location))
@@ -215,7 +218,6 @@ module dts './app/dts.bicep' = {
       '0.0.0.0/0'
     ]
     skuName: dtsSkuName
-    skuCapacity: dtsCapacity
   }
 }
 
@@ -241,7 +243,7 @@ module dtsDashboardRoleAssignment 'app/dts-Access.bicep' = {
   params: {
     roleDefinitionID: dtsRoleDefinitionId
     principalID: principalId
-    principalType: 'User'
+    principalType: principalType
     dtsName: dts.outputs.dts_NAME
   }
 }
