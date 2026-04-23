@@ -1,140 +1,162 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Http;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Azure.WebJobs.Extensions.Http;
+using Azure;
+using Azure.Data.Tables;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Table;
 using Octokit;
 
 namespace FanOutFanInCrawler
 {
     public static class Orchestrator
     {
-        // this needs to be configured when creating your Azure Function
-        // with the portal:
-        // https://docs.microsoft.com/en-us/azure/azure-functions/functions-how-to-use-azure-function-app-settings
-        // command line:
-        //
-        private static Func<string> getToken = () => Environment.GetEnvironmentVariable("GitHubToken", EnvironmentVariableTarget.Process);
-        private static GitHubClient github = new GitHubClient(new ProductHeaderValue("FanOutFanInCrawler")) { Credentials = new Credentials(getToken()) };
-        private static CloudStorageAccount account = CloudStorageAccount.Parse(Environment.GetEnvironmentVariable("AzureWebJobsStorage", EnvironmentVariableTarget.Process));
+        // GitHub token is expected in the "GitHubToken" app setting. See local.settings.json.sample.
+        private static readonly Func<string?> getToken = () => Environment.GetEnvironmentVariable("GitHubToken");
+
+        private static readonly GitHubClient github = new GitHubClient(new ProductHeaderValue("FanOutFanInCrawler"))
+        {
+            Credentials = !string.IsNullOrWhiteSpace(getToken()) ? new Credentials(getToken()) : Credentials.Anonymous
+        };
+
+        // Table storage connection string. Defaults to AzureWebJobsStorage (e.g. Azurite) unless overridden.
+        private static readonly Func<string?> getStorageConnectionString = () =>
+            Environment.GetEnvironmentVariable("StorageConnectionString")
+            ?? Environment.GetEnvironmentVariable("AzureWebJobsStorage");
 
         /// <summary>
-        /// Trigger function that will use HTTP to start an Orchestrator function
+        /// HTTP-triggered starter that kicks off the fan-out/fan-in orchestration.
         /// </summary>
-        /// <param name="req"></param>
-        /// <param name="starter"></param>
-        /// <param name="log"></param>
-        /// <returns></returns>
-        [FunctionName("Orchestrator_HttpStart")]
-        public static async Task<HttpResponseMessage> HttpStart(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequestMessage req,
-            [DurableClient] IDurableOrchestrationClient client,
-            ILogger log)
+        [Function("Orchestrator_HttpStart")]
+        public static async Task<HttpResponseData> HttpStart(
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequestData req,
+            [DurableClient] DurableTaskClient client,
+            FunctionContext executionContext)
         {
-            // Function input comes from the request content.
-            string instanceId = await client.StartNewAsync("Orchestrator", null, "Nuget");
+            ILogger logger = executionContext.GetLogger("Orchestrator_HttpStart");
 
-            log.LogInformation($"Started orchestration with ID = '{instanceId}'.");
+            string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
+                nameof(RunOrchestrator), "Nuget");
 
-            return client.CreateCheckStatusResponse(req, instanceId);
+            logger.LogInformation("Started orchestration with ID = '{instanceId}'.", instanceId);
+
+            return await client.CreateCheckStatusResponseAsync(req, instanceId);
         }
 
-        [FunctionName("Orchestrator")]
+        [Function(nameof(RunOrchestrator))]
         public static async Task<string> RunOrchestrator(
-            [OrchestrationTrigger] IDurableOrchestrationContext context)
+            [OrchestrationTrigger] TaskOrchestrationContext context)
         {
-            // retrieves the organization name from the Orchestrator_HttpStart function
-            var organizationName = context.GetInput<string>();
-            // retrieves the list of repositories for an organization by invoking a separate Activity Function.
-            var repositories = await context.CallActivityAsync<List<(long id, string name)>>("GetAllRepositoriesForOrganization", organizationName);
+            // Retrieve the organization name passed by the HTTP starter.
+            var organizationName = context.GetInput<string>() ?? "Nuget";
 
-            // Creates an array of task to store the result of each functions
-            var tasks = new Task<(long id, int openedIssues, string name)>[repositories.Count];
+            // Fetch the list of repositories for the organization via an activity.
+            var repositories = await context.CallActivityAsync<List<RepositoryInfo>>(
+                nameof(GetAllRepositoriesForOrganization), organizationName);
+
+            // Fan-out: start a `GetOpenedIssues` activity per repository in parallel.
+            var tasks = new Task<RepositoryIssueCount>[repositories.Count];
             for (int i = 0; i < repositories.Count; i++)
             {
-                // Starting a `GetOpenedIssues` activity WITHOUT `async`
-                // This will starts Activity Functions in parallel instead of sequentially.
-                tasks[i] = context.CallActivityAsync<(long, int, string)>("GetOpenedIssues", (repositories[i]));
+                tasks[i] = context.CallActivityAsync<RepositoryIssueCount>(
+                    nameof(GetOpenedIssues), repositories[i]);
             }
 
-            // Wait for all Activity Functions to complete execution
+            // Fan-in: wait for all the parallel activities to finish.
             await Task.WhenAll(tasks);
 
-            // Retrieve the result of each Activity Function and return them in a list
-            var openedIssues = tasks.Select(x => x.Result).ToList();
+            var openedIssues = tasks.Select(t => t.Result).ToList();
 
-            // Send the list to an Activity Function to save them to Blob Storage.
-            await context.CallActivityAsync("SaveRepositories", openedIssues);
+            // Persist the aggregated results to Table Storage.
+            await context.CallActivityAsync(nameof(SaveRepositories), openedIssues);
 
             return context.InstanceId;
         }
 
-        [FunctionName("GetAllRepositoriesForOrganization")]
-        public static async Task<List<(long id, string name)>> GetAllRepositoriesForOrganization([ActivityTrigger] IDurableActivityContext context)
+        [Function(nameof(GetAllRepositoriesForOrganization))]
+        public static async Task<List<RepositoryInfo>> GetAllRepositoriesForOrganization(
+            [ActivityTrigger] string organizationName)
         {
-            // retrieves the organization name from the Orchestrator function
-            var organizationName = context.GetInput<string>();
-            // invoke the API to retrieve the list of repositories of a specific organization
-            var repositories = (await github.Repository.GetAllForOrg(organizationName)).Select(x => (x.Id, x.Name)).ToList();
+            var repositories = (await github.Repository.GetAllForOrg(organizationName))
+                .Select(x => new RepositoryInfo(x.Id, x.Name))
+                .ToList();
             return repositories;
         }
 
-        [FunctionName("GetOpenedIssues")]
-        public static async Task<(long id, int openedIssues, string name)> GetOpenedIssues([ActivityTrigger] IDurableActivityContext context)
+        [Function(nameof(GetOpenedIssues))]
+        public static async Task<RepositoryIssueCount> GetOpenedIssues(
+            [ActivityTrigger] RepositoryInfo repository)
         {
-            // retrieve a tuple of repositoryId and repository name from the Orchestrator function
-            var parameters = context.GetInput<(long id, string name)>();
-
-            // retrieves a list of issues from a specific repository
-            var issues = (await github.Issue.GetAllForRepository(parameters.id)).ToList();
-
-            // returns a tuple of the count of opened issues for a specific repository
-            return (parameters.id, issues.Count(x => x.State == ItemState.Open), parameters.name);
+            var issues = (await github.Issue.GetAllForRepository(repository.Id)).ToList();
+            int openedIssues = issues.Count(x => x.State == ItemState.Open);
+            return new RepositoryIssueCount(repository.Id, openedIssues, repository.Name);
         }
 
-        [FunctionName("SaveRepositories")]
-        public static async Task SaveRepositories([ActivityTrigger] IDurableActivityContext context)
+        [Function(nameof(SaveRepositories))]
+        public static async Task SaveRepositories(
+            [ActivityTrigger] List<RepositoryIssueCount> parameters,
+            FunctionContext executionContext)
         {
-            // retrieves a tuple from the Orchestrator function
-            var parameters = context.GetInput<List<(long id, int openedIssues, string name)>>();
+            ILogger logger = executionContext.GetLogger(nameof(SaveRepositories));
 
-            // create the client and table reference for Blob Storage
-            var client = account.CreateCloudTableClient();
-            var table = client.GetTableReference("Repositories");
-
-            // create the table if it doesn't exist already.
-            await table.CreateIfNotExistsAsync();
-
-            // creates a batch of operation to be executed
-            var batchOperation = new TableBatchOperation();
-            foreach (var parameter in parameters)
+            var connectionString = getStorageConnectionString();
+            if (string.IsNullOrWhiteSpace(connectionString))
             {
-                // Creates an operation to add the repository to Table Storage
-                batchOperation.Add(TableOperation.InsertOrMerge(new Repository(parameter.id)
-                {
-                    OpenedIssues = parameter.openedIssues,
-                    RepositoryName = parameter.name
-                }));
+                throw new InvalidOperationException(
+                    "No storage connection string is configured. Set 'StorageConnectionString' or 'AzureWebJobsStorage'.");
             }
 
-            await table.ExecuteBatchAsync(batchOperation);
+            var serviceClient = new TableServiceClient(connectionString);
+            var tableClient = serviceClient.GetTableClient("Repositories");
+
+            await tableClient.CreateIfNotExistsAsync();
+
+            // Table Storage batch transactions must share a partition key and stay under 100 entities.
+            foreach (var chunk in parameters.Chunk(100))
+            {
+                var batch = chunk
+                    .Select(p => new TableTransactionAction(
+                        TableTransactionActionType.UpsertMerge,
+                        new RepositoryEntity(p.Id)
+                        {
+                            OpenedIssues = p.OpenedIssues,
+                            RepositoryName = p.Name
+                        }))
+                    .ToList();
+
+                if (batch.Count > 0)
+                {
+                    await tableClient.SubmitTransactionAsync(batch);
+                }
+            }
+
+            logger.LogInformation("Saved {count} repositories to Table Storage.", parameters.Count);
         }
 
-        public class Repository : TableEntity
+        public record RepositoryInfo(long Id, string Name);
+
+        public record RepositoryIssueCount(long Id, int OpenedIssues, string Name);
+
+        public class RepositoryEntity : ITableEntity
         {
-            public Repository(long id)
+            public RepositoryEntity() { }
+
+            public RepositoryEntity(long id)
             {
                 PartitionKey = "Default";
                 RowKey = id.ToString();
             }
+
+            public string PartitionKey { get; set; } = "Default";
+            public string RowKey { get; set; } = string.Empty;
+            public DateTimeOffset? Timestamp { get; set; }
+            public ETag ETag { get; set; }
             public int OpenedIssues { get; set; }
-            public string RepositoryName { get; set; }
+            public string RepositoryName { get; set; } = string.Empty;
         }
     }
 }
