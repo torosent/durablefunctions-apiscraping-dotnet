@@ -158,6 +158,7 @@ module rbac 'app/rbac.bicep' = {
     appInsightsName: monitoring.outputs.name
     managedIdentityPrincipalId: apiUserAssignedIdentity.outputs.principalId
     userIdentityPrincipalId: principalId
+    userIdentityPrincipalType: principalType
     enableBlob: storageEndpointConfig.enableBlob
     enableQueue: storageEndpointConfig.enableQueue
     enableTable: storageEndpointConfig.enableTable

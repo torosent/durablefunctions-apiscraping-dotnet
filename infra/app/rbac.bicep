@@ -3,6 +3,7 @@ param appInsightsName string
 param managedIdentityPrincipalId string // Principal ID for the Managed Identity
 param userIdentityPrincipalId string = '' // Principal ID for the User Identity
 param allowUserIdentityPrincipal bool = false // Flag to enable user identity role assignments
+param userIdentityPrincipalType string = 'User' // Principal type for the User Identity (User, ServicePrincipal, or Group)
 param enableBlob bool = true
 param enableQueue bool = false
 param enableTable bool = false
@@ -39,7 +40,7 @@ resource storageRoleAssignment_User 'Microsoft.Authorization/roleAssignments@202
   properties: {
     roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', storageRoleDefinitionId)
     principalId: userIdentityPrincipalId // Use user identity ID
-    principalType: 'User' // User Identity is a User Principal
+    principalType: userIdentityPrincipalType // Honors deployer principal type (User in interactive azd up, ServicePrincipal in CI)
   }
 }
 
@@ -61,7 +62,7 @@ resource queueRoleAssignment_User 'Microsoft.Authorization/roleAssignments@2022-
   properties: {
     roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', queueRoleDefinitionId)
     principalId: userIdentityPrincipalId // Use user identity ID
-    principalType: 'User' // User Identity is a User Principal
+    principalType: userIdentityPrincipalType // Honors deployer principal type (User in interactive azd up, ServicePrincipal in CI)
   }
 }
 
@@ -83,7 +84,7 @@ resource tableRoleAssignment_User 'Microsoft.Authorization/roleAssignments@2022-
   properties: {
     roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', tableRoleDefinitionId)
     principalId: userIdentityPrincipalId // Use user identity ID
-    principalType: 'User' // User Identity is a User Principal
+    principalType: userIdentityPrincipalType // Honors deployer principal type (User in interactive azd up, ServicePrincipal in CI)
   }
 }
 
@@ -105,6 +106,6 @@ resource appInsightsRoleAssignment_User 'Microsoft.Authorization/roleAssignments
   properties: {
     roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', monitoringRoleDefinitionId)
     principalId: userIdentityPrincipalId // Use user identity ID
-    principalType: 'User' // User Identity is a User Principal
+    principalType: userIdentityPrincipalType // Honors deployer principal type (User in interactive azd up, ServicePrincipal in CI)
   }
 }
